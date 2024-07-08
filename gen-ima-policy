@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+
+# shellcheck disable=SC2043
+
+DIR=$(dirname "$0")
+source "${DIR}/functions.sh"
+
+# flags
+FLAG_VERBOSE=1
+FLAG_REMOVE_BAD_SIGNATURES=2
+FLAG_GEN_MEASUREMENT_RULES=4
+FLAG_GEN_APPRAISAL_RULES=8
+FLAG_ADD_SPECIAL_RULES=16
+
+function call_check_ima_signature()
+{
+	local dir="$1"
+	local filetype="$2"
+	local report_failed="$3"
+	local ima_keys="$4"
+	local signkey="$5"
+	local flags="$6"
+
+	local params
+
+	params="--dir ${dir} --key ${ima_keys} --filetype ${filetype}"
+	[ "${signkey}" != "" ] && params+=" --signkey ${signkey}"
+	[ "${report_failed}" -ne 0 ] && params+=" --report-failed"
+	[ $((flags & FLAG_VERBOSE)) -ne 0 ] && params+=" --verbose"
+	[ $((flags & FLAG_REMOVE_BAD_SIGNATURES)) -ne 0 ] && params+=" --remove-bad-signatures"
+
+	check-ima-signature ${params}
+}
+
+function gen_policy_from_fs()
+{
+	local flags="$1"
+	local ima_keys="$2"
+	local signkey="$3"
+	local outfile="$4"
+
+	local tempdir labelfile semfile report_failed=1 prefix="dont_" label
+	local user role typ filetype func add files_generator find_opts dir
+
+	if ! tempdir=$(mktemp -d); then
+		exit 1
+	fi
+
+	labelfile="${tempdir}/labels"
+	semfile="${tempdir}/semanage_fcontext_list"
+
+	semanage fcontext -l > "${semfile}"
+
+	if [ -z "${outfile}" ]; then
+		exec 100>&1
+	else
+		exec 100>"${outfile}"
+	fi
+
+	echo "# policy generated with method 'filesystem'" >&100
+
+	ima_policy_generate_header \
+		"$((flags & FLAG_GEN_APPRAISAL_RULES))" \
+		"$((flags & FLAG_GEN_MEASUREMENT_RULES))" \
+		>&100
+
+	for filetype in "executable" "library" "other"; do
+		echo "Working on file type '${filetype}':"
+		rm -f "${labelfile}"
+
+		case "${filetype}" in
+		executable)
+			func="BPRM_CHECK"
+			add=""
+			files_generator=get_executable_dirs
+			find_opts="-type f -executable -print"
+			;;
+		library)
+			func="MMAP_CHECK"
+			add=" mask=MAY_EXEC"
+			files_generator=get_library_dirs
+			find_opts="-type f -name *.so* -executable -print"
+			;;
+		other)
+			func="FILE_CHECK"
+			add=" mask=^MAY_READ"
+			files_generator=get_text_file_dirs
+			find_opts="-type f"
+			;;
+		esac
+		if [ -z "${prefix}" ]; then
+			add+=" uid=0"
+		fi
+
+		# Add some special rules for BPRM_CHECK and MMAP_CHECK if docker or podman
+		# are installed
+		if type -P podman >/dev/null || type -P docker >/dev/null; then
+			# add a few container-specific labels if they exist in current policy
+			case "${filetype}" in
+			executable)
+				sed -n 's/.*\(system_u:object_r:container_file_t\):s0/\1/p' < "${semfile}" \
+				| sort \
+				| uniq >> "${labelfile}"
+
+				# docker: needs the following during (container) startup to be able
+				# to run its dynamically created ../check files.
+				if type -P docker >/dev/null; then
+					for label in \
+						system_u:object_r:container_var_lib_t; do
+						sed -n "s/.*\(${label}\):s0/\1:s0/p" < "${semfile}" \
+						| sort \
+						| uniq >> "${labelfile}"
+					done
+				fi
+				;;
+			library)
+				sed -n 's/.*\(system_u:object_r:container_file_t\):s0/\1:s0/p' < "${semfile}" \
+				| sort \
+				| uniq >> "${labelfile}"
+				;;
+			other)
+				grep -E "^(/var/lib/docker|/var/lib/containers)" < "${semfile}" \
+				| sed -n 's|.*\(system_u:object_r:[^:]*\):s0|\1:s0|p' >> "${labelfile}"
+				;;
+			esac
+		fi
+
+		for dir in "/tmp/"; do
+			printf "%-20s: Gathering SELinux labels\n" "${dir}"
+			ima_selinux_gather_labels_by_dir \
+				"${dir}" \
+				"${find_opts}" \
+				>> "${labelfile}"
+		done
+
+		for dir in $(eval "${files_generator}" "${semfile}"); do
+			printf "%-20s: Checking for badly signed and unsigned files\n" "${dir}"
+			if [ -d "${dir}" ]; then
+				call_check_ima_signature \
+					"${dir}" \
+					"${filetype}" \
+					"${report_failed}" \
+					"${ima_keys}" \
+					"${signkey}" \
+					"${flags}" \
+					>> "${labelfile}"
+			else
+				#only a file or wilcard; use simple script
+				ima_selinux_check_signatures_by_dir \
+					"${dir}" \
+					"${find_opts}" \
+					"${report_failed}" \
+					"${ima_keys}" \
+					"${signkey}" \
+					"$((flags & FLAG_VERBOSE))" \
+					>> "${labelfile}"
+			fi
+		done
+
+		sed -E 's/[[:space:]]+$//' < "${labelfile}" \
+			| sort \
+			| uniq \
+			| while read -r label; do
+			user=$(echo "${label}" | cut -d":" -f1)
+			role=$(echo "${label}" | cut -d":" -f2)
+			typ=$(echo "${label}" | cut -d":" -f3)
+			[ $((flags & FLAG_GEN_APPRAISAL_RULES)) -ne 0 ] && \
+				echo "${prefix}appraise func=${func}${add} obj_user=${user} obj_role=${role} obj_type=${typ}"
+			[ $((flags & FLAG_GEN_MEASUREMENT_RULES)) -ne 0 ] && \
+				echo "${prefix}measure  func=${func}${add} obj_user=${user} obj_role=${role} obj_type=${typ}"
+		done >&100
+
+		# tail of the policy
+		if [ -z "${prefix}" ]; then
+			[ $((flags & FLAG_GEN_APPRAISAL_RULES)) -ne 0 ] && \
+				echo "dont_appraise func=${func} uid=0" >&100
+			[ $((flags & FLAG_GEN_MEASUREMENT_RULES)) -ne 0 ] && \
+				echo "dont_measure  func=${func} uid=0" >&100
+		else
+			[ $((flags & FLAG_GEN_APPRAISAL_RULES)) -ne 0 ] && \
+				echo "appraise func=${func}${add} uid=0 appraise_type=imasig" >&100
+			[ $((flags & FLAG_GEN_MEASUREMENT_RULES)) -ne 0 ] && \
+				echo "measure  func=${func}${add} uid=0" >&100
+		fi
+
+	done
+
+	if [ $((flags & FLAG_GEN_APPRAISAL_RULES)) -ne 0 ] && \
+	   [ $((flags & FLAG_ADD_SPECIAL_RULES)) -ne 0 ]; then
+		for func in \
+			MODULE_CHECK \
+			FIRMWARE_CHECK \
+			KEXEC_KERNEL_CHECK \
+			POLICY_CHECK; do
+			echo "appraise func=${func} appraise_type=imasig" >&100
+		done
+	fi
+
+	exec 100>&-
+	rm -rf "${tempdir}"
+}
+
+function usage()
+{
+	local prg="$1"
+
+	cat <<_EOF_
+Usage: ${prg} method [options]
+
+
+The following methods are supported:
+
+filesystem       : Generate IMA policy rules based on file usage
+
+
+Available options are:
+
+-k <imakey>      : IMA signature verification key; can be provided multiple
+                   times
+
+-S <private key> : Sign unsigned or not properly signed files with this key.
+                   This will avoid rules with exceptions in the policy.
+
+-a               : Generate appraisal rules
+
+-m               : Generate measurement rules
+
+-o <filename>    : File where to write policy rules into
+
+-s               : Add special appraisal rules to the policy for MODULE_CHECK,
+                   FIRMWARE_CHECK, KEXEC_KERNEL_CHECK, and POLICY_CHECK.
+
+-v               : Verbose output for debugging
+
+-h               : Display this help screen and exit
+
+
+How to use this tool on an SELinux system with IMA appraisal enabled:
+
+1. Install all software that's necessary for this system. Uninstall unnecessary
+   packages.
+
+2. Optional: Run this tool to sign all files (-S option) with a local IMA code
+   signing key. For example, on UEFI-based systems this key's CA should be
+   loaded into the MOK DB and its x.509 be put into /etc/keys/ima so that it can
+   be used for signature verification.
+   => All files will be signed at this point (declared immutable) and the
+      resulting policy will have no SELinux label-based exceptions. Do not run
+      the system with this policy, since it will not function properly since
+      not all files are actually immutable.
+      This step is optional and requires that the system support a local
+      code signing key. UEFI-based systems support this with the MOK DB when
+      secure boot is enabled. Other platforms, such as PowerVM, also support
+      it.
+      If this step is/must be skipped then the resulting policy may have more
+      SELinux labels-based exceptions.
+
+3. Use the system as it will be used for every-day use later on. Also reboot it
+   at least once.
+   => The purpose of this step is to find files that will be modified
+      and created (mutable files) during every-day system usage.
+      New files that will be created will not be signed and will require
+      an exception given their SELinux labels. Existing files that were
+      modified during this step will have an invalid signature and also
+      need SELinux label-based exceptions.
+
+4. Using this tool create the IMA measurement and/or appraisal policy. Pass all
+   relevant keys for signature verification to it. Copy the policy to
+   /etc/ima/ima-policy and sign it with the local key.
+   => Files that will be modified and/or created (mutable files) while the
+      system is in normal use will have SELinux label-based exceptions in the
+      policy so that these files are not measured and/or appraised.
+      What this method does not find are SELinux labels of those files that
+      only exist temporarily. Therefore, it may be necessary to check the
+      audit log in step 5 and add missing rules to the policy when the system
+      is running. An example of this type of files may be files for the
+      printer spooler (print_spool_t).
+
+5. Use the system.
+
+6. Whenever new software needs to be installed or applications are to be used
+   in ways they were not used in step 3., start over at step 2 or 3. You will
+   likely need to deactivate (rename policy and reboot) the current IMA policy
+   in this case.
+
+_EOF_
+}
+
+function main()
+{
+	local ima_keys outfile arg flags=0 method signkey tool
+
+	method="$1"
+	shift
+
+	for tool in "semanage" "find" "grep" "sed" "evmctl"; do
+		if ! type -P "${tool}" &>/dev/null; then
+			echo "Please install ${tool}."
+			exit 1
+		fi
+	done
+
+	case "${method}" in
+	filesystem)
+		;;
+	imalog)
+		if [ "$(id -u)" -ne 0 ]; then
+			echo "This program must be run as root."
+			exit 1
+		fi
+		;;
+	-h)
+		usage "$0"
+		exit 0
+		;;
+	*)
+		echo "Unsupported method '${method}'" >&2
+		exit 1
+		;;
+	esac
+
+	while getopts "hk:o:vamsnS:r" arg; do
+		case "$arg" in
+		v)
+			flags=$((flags | FLAG_VERBOSE))
+			;;
+		m)
+			flags=$((flags | FLAG_GEN_MEASUREMENT_RULES))
+			;;
+		a)
+			flags=$((flags | FLAG_GEN_APPRAISAL_RULES))
+			;;
+		r)
+			flags=$((flags | FLAG_REMOVE_BAD_SIGNATURES))
+			;;
+		s)
+			flags=$((flags | FLAG_ADD_SPECIAL_RULES))
+			;;
+		o)
+			outfile="${OPTARG}"
+			;;
+		k)
+			if [ -z "${ima_keys}" ]; then
+				ima_keys="${OPTARG}"
+			else
+				ima_keys="${ima_keys},${OPTARG}"
+			fi
+			;;
+		S)
+			signkey="${OPTARG}"
+			;;
+		h)
+			usage "$0"
+			exit 0
+			;;
+		*)
+			exit 1
+			;;
+		esac
+	done
+
+	if [ -z "${ima_keys}" ]; then
+		echo "Missing imakey (-k) option."
+		exit 1
+	fi
+
+	case "${method}" in
+	filesystem)
+		if [ $((flags & FLAG_INCLUDES_POLICY)) -ne 0 ]; then
+			echo "The -I option is not supported with this method"
+			return 1
+		fi
+		gen_policy_from_fs \
+			"${flags}" "${ima_keys}" "${signkey}" "${outfile}"
+		;;
+	esac
+
+	return 0
+}
+
+main "$@"
+exit $?
