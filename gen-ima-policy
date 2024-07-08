@@ -32,6 +32,26 @@ function call_check_ima_signature()
 	check-ima-signature ${params}
 }
 
+function generate_rule_for_label()
+{
+	local flags="$1"
+	local label="$2"
+	local prefix="$3"
+	local func="$4"
+	local add="$5"
+	local subj="$6"
+
+	local user role typ
+
+	user=$(echo "${label}" | cut -d":" -f1)
+	role=$(echo "${label}" | cut -d":" -f2)
+	typ=$(echo "${label}" | cut -d":" -f3)
+	[ $((flags & FLAG_GEN_APPRAISAL_RULES)) -ne 0 ] && \
+		echo "${prefix}appraise func=${func}${add} obj_user=${user} obj_role=${role} obj_type=${typ} ${subj}"
+	[ $((flags & FLAG_GEN_MEASUREMENT_RULES)) -ne 0 ] && \
+		echo "${prefix}measure  func=${func}${add} obj_user=${user} obj_role=${role} obj_type=${typ} ${subj}"
+}
+
 function gen_policy_from_fs()
 {
 	local flags="$1"
@@ -40,13 +60,14 @@ function gen_policy_from_fs()
 	local outfile="$4"
 
 	local tempdir labelfile semfile report_failed=1 prefix="dont_" label
-	local user role typ filetype func add files_generator find_opts dir
+	local user role typ filetype func add files_generator find_opts dir lbl
 
 	if ! tempdir=$(mktemp -d); then
 		exit 1
 	fi
 
 	labelfile="${tempdir}/labels"
+	container_labelfile="${tempdir}/container_labels"
 	semfile="${tempdir}/semanage_fcontext_list"
 
 	semanage fcontext -l > "${semfile}"
@@ -66,7 +87,7 @@ function gen_policy_from_fs()
 
 	for filetype in "executable" "library" "other"; do
 		echo "Working on file type '${filetype}':"
-		rm -f "${labelfile}"
+		rm -f "${labelfile}" "container_labelfile"
 
 		case "${filetype}" in
 		executable)
@@ -100,7 +121,23 @@ function gen_policy_from_fs()
 			executable)
 				sed -n 's/.*\(system_u:object_r:container_file_t\):s0/\1/p' < "${semfile}" \
 				| sort \
-				| uniq >> "${labelfile}"
+				| uniq \
+				| while read -r lbl; do
+					generate_rule_for_label \
+						"${flags}" \
+						"${lbl}" \
+						"${prefix}" \
+						"${func}" \
+						"${add}" \
+						"subj_user=system_u subj_role=system_r subj_type=container_runtime_t"
+					generate_rule_for_label \
+						"${flags}" \
+						"${lbl}" \
+						"${prefix}" \
+						"${func}" \
+						"${add}" \
+						"subj_user=system_u subj_role=system_r subj_type=container_t"
+				done >&100
 
 				# docker: needs the following during (container) startup to be able
 				# to run its dynamically created ../check files.
@@ -109,7 +146,16 @@ function gen_policy_from_fs()
 						system_u:object_r:container_var_lib_t; do
 						sed -n "s/.*\(${label}\):s0/\1:s0/p" < "${semfile}" \
 						| sort \
-						| uniq >> "${labelfile}"
+						| uniq \
+						| while read -r lbl; do
+							generate_rule_for_label \
+								"${flags}" \
+								"${lbl}" \
+								"${prefix}" \
+								"${func}" \
+								"${add}" \
+								"subj_user=system_u subj_role=system_r subj_type=container_runtime_t"
+						done >&100
 					done
 				fi
 				;;
@@ -160,14 +206,14 @@ function gen_policy_from_fs()
 		sed -E 's/[[:space:]]+$//' < "${labelfile}" \
 			| sort \
 			| uniq \
-			| while read -r label; do
-			user=$(echo "${label}" | cut -d":" -f1)
-			role=$(echo "${label}" | cut -d":" -f2)
-			typ=$(echo "${label}" | cut -d":" -f3)
-			[ $((flags & FLAG_GEN_APPRAISAL_RULES)) -ne 0 ] && \
-				echo "${prefix}appraise func=${func}${add} obj_user=${user} obj_role=${role} obj_type=${typ}"
-			[ $((flags & FLAG_GEN_MEASUREMENT_RULES)) -ne 0 ] && \
-				echo "${prefix}measure  func=${func}${add} obj_user=${user} obj_role=${role} obj_type=${typ}"
+			| while read -r lbl; do
+			generate_rule_for_label \
+				"${flags}" \
+				"${lbl}" \
+				"${prefix}" \
+				"${func}" \
+				"${add}" \
+				""
 		done >&100
 
 		# tail of the policy
@@ -229,6 +275,11 @@ Available options are:
 
 -s               : Add special appraisal rules to the policy for MODULE_CHECK,
                    FIRMWARE_CHECK, KEXEC_KERNEL_CHECK, and POLICY_CHECK.
+
+-r               : Remove bad signatures from files
+                   NOTE: All files for which no signature verification key
+                   was passed and therefore fail signature verification will
+                   have their signature removed.
 
 -v               : Verbose output for debugging
 
