@@ -137,6 +137,14 @@ function gen_policy_from_fs()
 						"${func}" \
 						"${add}" \
 						"subj_user=system_u subj_role=system_r subj_type=container_t"
+					# for super privileged containers (spc; --privileged)
+					generate_rule_for_label \
+						"${flags}" \
+						"${lbl}" \
+						"${prefix}" \
+						"${func}" \
+						"${add}" \
+						"subj_user=system_u subj_role=system_r subj_type=spc_t"
 				done >&100
 
 				# docker: needs the following during (container) startup to be able
